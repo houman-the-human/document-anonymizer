@@ -14,19 +14,26 @@ from document_anonymizer.core.rules import (
 from document_anonymizer.core.vault import MaskingVault
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 MAX_SERIALIZED_VAULT_BYTES = 64 * 1024 * 1024
 MAX_RULES = 10_000
 MAX_MAPPINGS = 1_000_000
 
-ROOT_KEYS = {
+ROOT_KEYS_V1 = {
     "schema_version",
     "vault_id",
     "rules",
     "mappings",
     "reserved_tokens",
 }
+
+ROOT_KEYS_V2 = ROOT_KEYS_V1 | {
+    "normalization",
+    "ignore_zwnj",
+}
+
+ROOT_KEYS_V3 = ROOT_KEYS_V2 | {"metadata_snapshot"}
 
 RULE_KEYS = {
     "rule_id",
@@ -148,6 +155,9 @@ def serialize_vault(vault: MaskingVault) -> bytes:
     payload = {
         "schema_version": SCHEMA_VERSION,
         "vault_id": vault.vault_id,
+        "normalization": vault.normalization,
+        "ignore_zwnj": vault.ignore_zwnj,
+        "metadata_snapshot": vault.metadata_snapshot,
         "rules": rules,
         "mappings": token_state["mappings"],
         "reserved_tokens": token_state["reserved_tokens"],
@@ -200,18 +210,37 @@ def deserialize_vault(data: bytes) -> MaskingVault:
             "Vault payload must be a JSON object"
         )
 
-    if set(payload) != ROOT_KEYS:
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int or schema_version not in (1, 2, SCHEMA_VERSION):
+        raise VaultFormatError(
+            "Unsupported vault schema version"
+        )
+
+    expected_root_keys = (
+        ROOT_KEYS_V1 if schema_version == 1
+        else ROOT_KEYS_V2 if schema_version == 2
+        else ROOT_KEYS_V3
+    )
+    if set(payload) != expected_root_keys:
         raise VaultFormatError(
             "Invalid vault payload structure"
         )
 
-    if (
-        type(payload["schema_version"]) is not int
-        or payload["schema_version"] != SCHEMA_VERSION
-    ):
-        raise VaultFormatError(
-            "Unsupported vault schema version"
-        )
+    normalization = payload.get("normalization", "none")
+    ignore_zwnj = payload.get("ignore_zwnj", False)
+    if not isinstance(normalization, str) or not isinstance(ignore_zwnj, bool):
+        raise VaultFormatError("Invalid vault normalization settings")
+
+    metadata_snapshot = payload.get("metadata_snapshot")
+    if schema_version == 3 and metadata_snapshot is not None:
+        if not isinstance(metadata_snapshot, dict):
+            raise VaultFormatError("Invalid metadata snapshot in vault")
+        try:
+            metadata_size = len(_encode_json(metadata_snapshot))
+        except (TypeError, ValueError) as exc:
+            raise VaultFormatError("Metadata snapshot is not valid JSON data") from exc
+        if metadata_size > 16 * 1024 * 1024:
+            raise VaultFormatError("Metadata snapshot exceeds maximum allowed size")
 
     vault_id = payload["vault_id"]
 
@@ -268,16 +297,25 @@ def deserialize_vault(data: bytes) -> MaskingVault:
             "Too many reserved tokens"
         )
 
-    vault = MaskingVault(
-        ruleset=ruleset,
-        vault_id=vault_id,
-    )
+    try:
+        vault = MaskingVault(
+            ruleset=ruleset,
+            vault_id=vault_id,
+            normalization=normalization,
+            ignore_zwnj=ignore_zwnj,
+        )
+    except (TypeError, ValueError) as exc:
+        raise VaultFormatError(
+            "Invalid vault normalization settings"
+        ) from exc
 
     try:
         vault.restore_token_state(
             mappings=mappings,
             reserved_tokens=reserved_tokens,
         )
+        if schema_version == 3:
+            vault.restore_metadata_snapshot(metadata_snapshot)
 
     except (TypeError, ValueError) as exc:
         raise VaultIntegrityError(

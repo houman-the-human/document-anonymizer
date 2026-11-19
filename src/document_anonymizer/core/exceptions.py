@@ -18,6 +18,10 @@ class ZeroWidthMatchError(MaskingError):
     """Raised when a regex produces an empty match."""
 
 
+class UnsafeNormalizedMatchError(MaskingError, ValueError):
+    """Raised when a normalized match cannot map safely to source text."""
+
+
 # Token-related errors
 
 class TokenGenerationError(MaskingError):

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "document-anonymizer"
-version = "0.1.0"
-description = "Reversible document text masking and restoration"
+version = "0.2.0"
+description = "Reversible content and metadata anonymization for PDF, DOCX, and XLSX"
 requires-python = ">=3.10"
 dependencies = [
     "regex>=2024.0.0",

@@ -355,3 +355,84 @@ def test_legacy_token_mappings_are_restored():
     assert restored.get_original(legacy_token) == "Jane Doe"
 
     assert restored.get_token("Jane Doe") == legacy_token
+
+
+def test_normalization_settings_are_preserved():
+    ruleset = RuleSet((
+        MaskingRule("person", "literal", "علی"),
+    ))
+    original = MaskingVault(
+        ruleset,
+        normalization="persian",
+        ignore_zwnj=True,
+    )
+    restored = deserialize_vault(serialize_vault(original))
+
+    assert restored.normalization == "persian"
+    assert restored.ignore_zwnj is True
+
+
+def test_legacy_schema_v1_vault_defaults_to_no_normalization():
+    payload = json.loads(serialize_vault(create_vault()))
+    payload["schema_version"] = 1
+    payload.pop("normalization")
+    payload.pop("ignore_zwnj")
+    payload.pop("metadata_snapshot")
+
+    restored = deserialize_vault(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    )
+
+    assert restored.normalization == "none"
+    assert restored.ignore_zwnj is False
+
+
+def test_invalid_normalization_settings_are_rejected():
+    payload = json.loads(serialize_vault(create_vault()))
+    payload["normalization"] = "unsafe-mode"
+
+    with pytest.raises(VaultFormatError, match="normalization"):
+        deserialize_vault(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        )
+
+
+def test_zwnj_setting_requires_persian_mode():
+    payload = json.loads(serialize_vault(create_vault()))
+    payload["normalization"] = "unicode"
+    payload["ignore_zwnj"] = True
+
+    with pytest.raises(VaultFormatError, match="normalization"):
+        deserialize_vault(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        )
+
+
+
+def test_persian_original_mapping_survives_vault_serialization_exactly():
+    ruleset = RuleSet((
+        MaskingRule("person", "literal", "علی رضایی"),
+    ))
+    original_text = "علي رضايي"
+    vault = MaskingVault(
+        ruleset,
+        normalization="persian",
+    )
+    token = vault.get_or_create_token(original_text)
+
+    restored = deserialize_vault(serialize_vault(vault))
+
+    assert restored.normalization == "persian"
+    assert restored.get_original(token) == original_text
+    assert restored.get_token(original_text) == token
+
+
+def test_legacy_schema_v2_vault_defaults_to_no_metadata_snapshot():
+    payload = json.loads(serialize_vault(create_vault()))
+    payload["schema_version"] = 2
+    payload.pop("metadata_snapshot")
+
+    restored = deserialize_vault(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    )
+    assert restored.metadata_snapshot is None

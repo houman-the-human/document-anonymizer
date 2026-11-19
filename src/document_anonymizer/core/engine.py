@@ -44,6 +44,8 @@ class MaskingEngine:
         self.matcher = Matcher(
             ruleset=vault.ruleset,
             regex_timeout_seconds=regex_timeout_seconds,
+            normalization=vault.normalization,
+            ignore_zwnj=vault.ignore_zwnj,
         )
 
     # -------------------------------------------------

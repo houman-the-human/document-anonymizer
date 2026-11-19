@@ -8,6 +8,7 @@ from .exceptions import (
     RuleValidationError,
     ZeroWidthMatchError,
 )
+from .normalization import normalize_pattern, validate_normalization
 
 
 RuleKind = Literal["literal", "regex"]
@@ -244,18 +245,36 @@ def get_regex_flags(rule: MaskingRule) -> int:
     return flags
 
 
-def compile_rule(rule: MaskingRule) -> regex.Pattern:
+def compile_rule(
+    rule: MaskingRule,
+    normalization: str = "none",
+    *,
+    ignore_zwnj: bool = False,
+) -> regex.Pattern:
     """
     Compile a masking rule into a regex pattern.
 
-    Literal patterns are escaped so special characters
-    are treated as ordinary text.
+    Rule patterns are normalized with the same policy as document text.
+    Literal patterns are escaped so special characters remain literal.
     """
+    normalization, ignore_zwnj = validate_normalization(
+        normalization,
+        ignore_zwnj,
+    )
+    normalized_pattern = normalize_pattern(
+        rule.pattern,
+        normalization,
+        ignore_zwnj=ignore_zwnj,
+    )
+    if not normalized_pattern:
+        raise RuleValidationError(
+            f"Rule '{rule.rule_id}' becomes empty after normalization"
+        )
 
     expression = (
-        regex.escape(rule.pattern)
+        regex.escape(normalized_pattern)
         if rule.kind == "literal"
-        else rule.pattern
+        else normalized_pattern
     )
 
     try:

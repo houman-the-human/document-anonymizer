@@ -1643,3 +1643,80 @@ def test_restore_pdf_round_trip_restores_multiline_match(tmp_path):
     assert "0912345678" not in masked_text
     assert "Jane Doe\nPhone: 0912345678" in restored_text
     assert "Address: New York" in restored_text
+
+
+
+def test_pdf_persian_normalization_maps_arabic_presentation_forms_and_restores(tmp_path):
+    from pathlib import Path
+
+    font_candidates = (
+        Path("/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("C:/Windows/Fonts/arial.ttf"),
+        Path("C:/Windows/Fonts/tahoma.ttf"),
+    )
+    font_path = next((item for item in font_candidates if item.is_file()), None)
+    if font_path is None:
+        pytest.skip("No Arabic-capable font is installed for the PDF RTL test")
+
+    source = tmp_path / "persian-rtl.pdf"
+    redacted = tmp_path / "persian-rtl-redacted.pdf"
+    masked = tmp_path / "persian-rtl-masked.pdf"
+    restored = tmp_path / "persian-rtl-restored.pdf"
+
+    document = pymupdf.open()
+    page = document.new_page(width=520, height=220)
+    html = (
+        '<div style="font-family: Noto; font-size: 12pt;">KEEP BEFORE</div>'
+        '<div dir="rtl" style="font-family: Noto; font-size: 22pt;">علی رضایی</div>'
+        '<div style="font-family: Noto; font-size: 12pt;">KEEP AFTER</div>'
+    )
+    css = (
+        f'@font-face {{font-family: Noto; src: url("{font_path.as_posix()}");}}'
+    )
+    page.insert_htmlbox(
+        pymupdf.Rect(20, 15, 500, 200),
+        html,
+        css=css,
+    )
+    document.save(source)
+    document.close()
+
+    extracted = extract_pdf_text(source)
+    source_text = extracted.pages[0].text
+    assert "KEEP\u00a0BEFORE" in source_text
+    assert "KEEP\u00a0AFTER" in source_text
+
+    rules = RuleSet((
+        MaskingRule("persian-name", "literal", "علي رضايي"),
+    ))
+    engine = MaskingEngine(
+        MaskingVault(rules, normalization="persian")
+    )
+    plan = build_pdf_masking_plan(extracted, engine)
+
+    assert plan.total_replacements == 1
+    replacement = plan.pages[0].replacements[0]
+    assert len(replacement.character_boxes) == len(replacement.original)
+    assert "KEEP BEFORE" not in replacement.original
+    assert "KEEP AFTER" not in replacement.original
+
+    redact_pdf(plan, redacted)
+    insert_pdf_tokens(redacted, plan, masked)
+    masked_text = "\n".join(
+        page.text for page in extract_pdf_text(masked).pages
+    )
+
+    assert replacement.original not in masked_text
+    assert engine.vault.get_token(replacement.original) in masked_text
+    assert "KEEP\u00a0BEFORE" in masked_text
+    assert "KEEP\u00a0AFTER" in masked_text
+
+    restore_pdf(masked, plan, restored)
+    restored_text = "\n".join(
+        page.text for page in extract_pdf_text(restored).pages
+    )
+    assert replacement.original in restored_text
+    assert "KEEP\u00a0BEFORE" in restored_text
+    assert "KEEP\u00a0AFTER" in restored_text

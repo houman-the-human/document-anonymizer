@@ -2240,3 +2240,134 @@ def test_apply_xlsx_unmasking_plan_cleans_temporary_file_on_failure(
 
     assert not output.exists()
     assert list(tmp_path.glob(".cleanup-restored.*.tmp.xlsx")) == []
+
+
+
+def test_xlsx_unmasking_ignores_writer_generated_modified_timestamp(
+    tmp_path,
+    monkeypatch,
+):
+    from datetime import datetime as RealDateTime
+    import openpyxl.writer.excel as excel_writer
+
+    source = tmp_path / "writer-modified-source.xlsx"
+    token = f"[[MASK_{'7' * 32}]]"
+
+    workbook = Workbook()
+    workbook.active["A1"] = token
+    workbook.properties.creator = "Original Creator"
+    workbook.properties.title = "Original Workbook"
+    workbook.save(source)
+    workbook.close()
+
+    plan = build_xlsx_unmasking_plan(
+        extract_xlsx_text(source),
+        FakeXLSXUnmaskEngine({
+            token: "Jane Doe",
+        }),
+    )
+
+    class LaterDateTime(RealDateTime):
+        @classmethod
+        def now(cls, tz=None):
+            return RealDateTime(2035, 1, 2, 3, 4, 5, tzinfo=tz)
+
+    # openpyxl intentionally refreshes the core-property modified timestamp
+    # during save. Force it to a different second to make the race deterministic.
+    monkeypatch.setattr(
+        excel_writer.datetime,
+        "datetime",
+        LaterDateTime,
+    )
+
+    output = tmp_path / "writer-modified-restored.xlsx"
+    apply_xlsx_unmasking_plan(plan, output)
+
+    restored = load_workbook(output, data_only=False)
+    try:
+        assert restored.active["A1"].value == "Jane Doe"
+        assert restored.properties.creator == "Original Creator"
+        assert restored.properties.title == "Original Workbook"
+        assert restored.properties.modified == RealDateTime(
+            2035, 1, 2, 3, 4, 5
+        )
+    finally:
+        restored.close()
+
+
+def test_xlsx_persian_normalization_preserves_exact_original_spelling(tmp_path):
+    source = tmp_path / "persian.xlsx"
+    masked = tmp_path / "persian-masked.xlsx"
+    restored = tmp_path / "persian-restored.xlsx"
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "مشتریان"
+    worksheet["A1"] = "نام مشتری"
+    worksheet["B1"] = "علي كاظم"
+    workbook.save(source)
+    workbook.close()
+
+    rules = RuleSet((
+        MaskingRule("customer-name", "literal", "علی کاظم"),
+    ))
+    engine = MaskingEngine(
+        MaskingVault(rules, normalization="persian")
+    )
+
+    extracted = extract_xlsx_text(source)
+    plan = build_xlsx_masking_plan(extracted, engine)
+
+    assert plan.replacements_count == 1
+    cell_plan = next(
+        cell
+        for worksheet_plan in plan.worksheets
+        for cell in worksheet_plan.cells
+        if cell.source_cell.coordinate == "B1"
+    )
+    assert cell_plan.source_cell.value == "علي كاظم"
+    assert cell_plan.masked_value == engine.vault.get_token("علي كاظم")
+
+    apply_xlsx_masking_plan(plan, masked)
+    masked_workbook = load_workbook(masked)
+    assert "علي كاظم" not in str(masked_workbook["مشتریان"]["B1"].value)
+    masked_workbook.close()
+
+    unmask_plan = build_xlsx_unmasking_plan(
+        extract_xlsx_text(masked),
+        engine,
+    )
+    apply_xlsx_unmasking_plan(unmask_plan, restored)
+
+    restored_workbook = load_workbook(restored)
+    assert restored_workbook["مشتریان"]["B1"].value == "علي كاظم"
+    restored_workbook.close()
+
+
+def test_xlsx_persian_zwnj_optional_matching_preserves_source(tmp_path):
+    source = tmp_path / "persian-zwnj.xlsx"
+    masked = tmp_path / "persian-zwnj-masked.xlsx"
+
+    workbook = Workbook()
+    workbook.active["A1"] = "می‌روم"
+    workbook.save(source)
+    workbook.close()
+
+    rules = RuleSet((MaskingRule("verb", "literal", "میروم"),))
+    engine = MaskingEngine(
+        MaskingVault(
+            rules,
+            normalization="persian",
+            ignore_zwnj=True,
+        )
+    )
+    plan = build_xlsx_masking_plan(extract_xlsx_text(source), engine)
+
+    assert plan.replacements_count == 1
+    cell_plan = plan.worksheets[0].cells[0]
+    assert cell_plan.source_cell.value == "می‌روم"
+    apply_xlsx_masking_plan(plan, masked)
+
+    masked_workbook = load_workbook(masked)
+    assert "می‌روم" not in str(masked_workbook.active["A1"].value)
+    masked_workbook.close()

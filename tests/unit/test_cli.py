@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import zipfile
 
 import pymupdf
 import pytest
@@ -12,6 +13,7 @@ from document_anonymizer import cli
 from document_anonymizer.adapters.docx import extract_docx_text
 from document_anonymizer.adapters.pdf import extract_pdf_text
 from document_anonymizer.adapters.xlsx import extract_xlsx_text
+from document_anonymizer.adapters.metadata import inspect_document_metadata
 
 
 PASSWORD = "cli-test-password"
@@ -46,6 +48,14 @@ def _create_docx(path: Path) -> None:
     document = Document()
     document.add_paragraph(f"Customer: {SENSITIVE}")
     document.add_paragraph("Email: alex.morgan@example.test")
+    properties = document.core_properties
+    properties.author = SENSITIVE
+    properties.last_modified_by = "Metadata Editor"
+    properties.title = "Confidential Customer File"
+    properties.subject = "Internal HR"
+    properties.keywords = "private, customer"
+    properties.comments = "Created for internal review"
+    properties.category = "Confidential"
     document.save(path)
 
 
@@ -57,6 +67,12 @@ def _create_xlsx(path: Path) -> None:
     worksheet["B1"] = SENSITIVE
     worksheet["A2"] = "Email"
     worksheet["B2"] = "alex.morgan@example.test"
+    workbook.properties.creator = SENSITIVE
+    workbook.properties.lastModifiedBy = "Metadata Editor"
+    workbook.properties.title = "Confidential Customer File"
+    workbook.properties.subject = "Internal HR"
+    workbook.properties.description = "Customer metadata description"
+    workbook.properties.keywords = "private, customer"
     workbook.save(path)
     workbook.close()
 
@@ -70,6 +86,17 @@ def _create_pdf(path: Path) -> None:
         "Email: alex.morgan@example.test",
         fontsize=14,
     )
+    document.set_metadata({
+        "title": "Confidential Customer File",
+        "author": SENSITIVE,
+        "subject": "Internal HR",
+        "keywords": "private, customer",
+        "creator": "Metadata Editor",
+        "producer": "Internal PDF Generator",
+        "creationDate": "D:20250412101010",
+        "modDate": "D:20250513101010",
+        "trapped": "False",
+    })
     document.save(path)
     document.close()
 
@@ -185,6 +212,14 @@ def test_cli_mask_and_restore_round_trip(
     assert SENSITIVE not in masked_text
     assert "alex.morgan@example.test" not in masked_text
 
+    masked_metadata = inspect_document_metadata(masked)
+    if extension == ".pdf":
+        assert all(value in (None, "") for value in masked_metadata["properties"].values())
+        assert masked_metadata["xmp"] == ""
+    else:
+        assert masked_metadata["properties"]["docProps/core.xml"] == {}
+        assert masked_metadata["properties"]["docProps/app.xml"] == {}
+
     result = _restore(
         monkeypatch,
         input_path=masked,
@@ -208,6 +243,18 @@ def test_cli_mask_and_restore_round_trip(
 
     assert SENSITIVE in restored_text
     assert "alex.morgan@example.test" in restored_text
+
+    restored_metadata = inspect_document_metadata(restored)
+    if extension == ".pdf":
+        assert restored_metadata["properties"]["author"] == SENSITIVE
+        assert restored_metadata["properties"]["title"] == "Confidential Customer File"
+    elif extension == ".docx":
+        assert restored_metadata["properties"]["docProps/core.xml"]["creator"] == SENSITIVE
+        assert restored_metadata["properties"]["docProps/core.xml"]["title"] == "Confidential Customer File"
+    else:
+        assert restored_metadata["properties"]["docProps/core.xml"]["creator"] == SENSITIVE
+        assert restored_metadata["properties"]["docProps/core.xml"]["title"] == "Confidential Customer File"
+
 
 
 def test_cli_requires_original_for_pdf_restore(tmp_path, monkeypatch, capsys):
@@ -318,3 +365,277 @@ def test_cli_parser_exposes_mask_and_restore_commands():
     )
     assert mask_args.command == "mask"
     assert restore_args.command == "restore"
+
+
+
+def test_cli_persian_normalization_is_persisted_and_used_for_restore(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from document_anonymizer.storage.file import FileVaultStore
+
+    source = tmp_path / "persian.docx"
+    masked = tmp_path / "persian-masked.docx"
+    restored = tmp_path / "persian-restored.docx"
+    vault_dir = tmp_path / "vaults"
+    rules = tmp_path / "persian-rules.json"
+    rules.write_text(
+        json.dumps({
+            "rules": [{
+                "rule_id": "customer-name",
+                "kind": "literal",
+                "pattern": "علی کاظم",
+            }, {
+                "rule_id": "zwnj-phrase",
+                "kind": "literal",
+                "pattern": "میروم",
+            }]
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    document = Document()
+    document.add_paragraph("نام مشتری: علي كاظم")
+    document.add_paragraph("عبارت: می‌روم")
+    document.save(source)
+
+    prompts = iter((PASSWORD, PASSWORD))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: next(prompts))
+    result = cli.main([
+        "mask",
+        "--input", str(source),
+        "--output", str(masked),
+        "--rules", str(rules),
+        "--vault-dir", str(vault_dir),
+        "--normalization", "persian",
+        "--ignore-zwnj",
+    ])
+    assert result == 0
+
+    output = capsys.readouterr().out
+    vault_id = next(
+        line.split(":", 1)[1].strip()
+        for line in output.splitlines()
+        if line.startswith("Vault ID:")
+    )
+    vault = FileVaultStore(vault_dir).load(vault_id, PASSWORD)
+    assert vault.normalization == "persian"
+    assert vault.ignore_zwnj is True
+
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: PASSWORD)
+    result = cli.main([
+        "restore",
+        "--input", str(masked),
+        "--output", str(restored),
+        "--vault-id", vault_id,
+        "--vault-dir", str(vault_dir),
+    ])
+    assert result == 0
+    assert extract_docx_text(restored).text == extract_docx_text(source).text
+
+
+def test_cli_ignore_zwnj_requires_persian_mode(tmp_path, capsys):
+    source = tmp_path / "source.docx"
+    _create_docx(source)
+    result = cli.main([
+        "mask",
+        "--input", str(source),
+        "--output", str(tmp_path / "masked.docx"),
+        "--rules", str(_rules_file(tmp_path)),
+        "--vault-dir", str(tmp_path / "vaults"),
+        "--normalization", "unicode",
+        "--ignore-zwnj",
+    ])
+    assert result == 2
+    assert "only be enabled" in capsys.readouterr().err
+
+
+def test_cli_help_includes_normalization_options(capsys):
+    parser = cli.build_parser()
+    args = parser.parse_args([
+        "mask",
+        "--input", "source.docx",
+        "--output", "masked.docx",
+        "--rules", "rules.json",
+        "--normalization", "persian",
+        "--ignore-zwnj",
+    ])
+    assert args.normalization == "persian"
+    assert args.ignore_zwnj is True
+
+
+def test_cli_sanitizes_metadata_only_values_even_without_matching_rules(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    source = tmp_path / "metadata-only.docx"
+    masked = tmp_path / "metadata-only-masked.docx"
+    restored = tmp_path / "metadata-only-restored.docx"
+    vault_dir = tmp_path / "vaults"
+
+    document = Document()
+    document.add_paragraph("This body contains no configured sensitive values.")
+    document.core_properties.author = "Metadata Only Private Author"
+    document.core_properties.title = "Metadata Only Confidential Title"
+    document.save(source)
+
+    vault_id = _mask(
+        monkeypatch,
+        input_path=source,
+        output_path=masked,
+        rules_path=_rules_file(tmp_path),
+        vault_dir=vault_dir,
+        capsys=capsys,
+    )
+
+    masked_metadata = inspect_document_metadata(masked)
+    assert masked_metadata["properties"]["docProps/core.xml"] == {}
+    assert "Metadata Only Private Author" not in masked.read_bytes().decode(
+        "latin-1", errors="ignore"
+    )
+
+    result = _restore(
+        monkeypatch,
+        input_path=masked,
+        output_path=restored,
+        vault_id=vault_id,
+        vault_dir=vault_dir,
+        capsys=capsys,
+    )
+    assert result == 0
+    restored_metadata = inspect_document_metadata(restored)
+    core = restored_metadata["properties"]["docProps/core.xml"]
+    assert core["creator"] == "Metadata Only Private Author"
+    assert core["title"] == "Metadata Only Confidential Title"
+
+
+def test_cli_rejects_docx_with_custom_properties_without_leaving_output(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    source = tmp_path / "custom.docx"
+    masked = tmp_path / "custom-masked.docx"
+    vault_dir = tmp_path / "vaults"
+    document = Document()
+    document.add_paragraph("Safe body")
+    document.save(source)
+
+    temp = source.with_suffix(".tmp")
+    with zipfile.ZipFile(source, "r") as original:
+        with zipfile.ZipFile(temp, "w", zipfile.ZIP_DEFLATED) as updated:
+            for item in original.infolist():
+                updated.writestr(item, original.read(item.filename))
+            updated.writestr(
+                "docProps/custom.xml",
+                b'<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"/>',
+            )
+    temp.replace(source)
+
+    prompts = iter((PASSWORD, PASSWORD))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: next(prompts))
+    result = cli.main([
+        "mask",
+        "--input", str(source),
+        "--output", str(masked),
+        "--rules", str(_rules_file(tmp_path)),
+        "--vault-dir", str(vault_dir),
+    ])
+
+    assert result == 2
+    assert not masked.exists()
+    assert not list(vault_dir.glob("*.vault"))
+    assert "custom document properties" in capsys.readouterr().err
+
+
+def test_cli_rejects_tampered_pdf_metadata_before_restoration(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    source = tmp_path / "source.pdf"
+    masked = tmp_path / "masked.pdf"
+    tampered = tmp_path / "tampered.pdf"
+    restored = tmp_path / "restored.pdf"
+    vault_dir = tmp_path / "vaults"
+    _create_pdf(source)
+
+    vault_id = _mask(
+        monkeypatch,
+        input_path=source,
+        output_path=masked,
+        rules_path=_rules_file(tmp_path),
+        vault_dir=vault_dir,
+        capsys=capsys,
+    )
+
+    document = pymupdf.open(masked)
+    document.set_metadata({
+        "title": "Tampered after masking",
+        "author": "",
+        "subject": "",
+        "keywords": "",
+        "creator": "",
+        "producer": "",
+        "creationDate": "",
+        "modDate": "",
+        "trapped": "",
+    })
+    document.save(tampered)
+    document.close()
+    tampered.replace(masked)
+
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: PASSWORD)
+    result = cli.main([
+        "restore",
+        "--input", str(masked),
+        "--original", str(source),
+        "--output", str(restored),
+        "--vault-id", vault_id,
+        "--vault-dir", str(vault_dir),
+    ])
+    assert result == 2
+    assert not restored.exists()
+    assert "fingerprint does not match" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("extension", [".docx", ".xlsx"])
+def test_cli_rejects_tampered_masked_ooxml_before_restoration(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    extension,
+):
+    original = tmp_path / f"Original{extension}"
+    masked = tmp_path / f"Masked{extension}"
+    restored = tmp_path / f"Restored{extension}"
+    vault_dir = tmp_path / "vaults"
+    if extension == ".docx":
+        _create_docx(original)
+    else:
+        _create_xlsx(original)
+
+    vault_id = _mask(
+        monkeypatch,
+        input_path=original,
+        output_path=masked,
+        rules_path=_rules_file(tmp_path),
+        vault_dir=vault_dir,
+        capsys=capsys,
+    )
+    with masked.open("ab") as target:
+        target.write(b"tampered-after-masking")
+
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: PASSWORD)
+    result = cli.main([
+        "restore",
+        "--input", str(masked),
+        "--output", str(restored),
+        "--vault-id", vault_id,
+        "--vault-dir", str(vault_dir),
+    ])
+    assert result == 2
+    assert not restored.exists()
+    assert "fingerprint does not match" in capsys.readouterr().err

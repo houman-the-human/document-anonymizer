@@ -26,6 +26,11 @@ from document_anonymizer.adapters.pdf import (
     redact_pdf,
     restore_pdf,
 )
+from document_anonymizer.adapters.metadata import (
+    mask_document_metadata,
+    restore_document_metadata,
+    verify_masked_document,
+)
 from document_anonymizer.adapters.xlsx import (
     apply_xlsx_masking_plan,
     apply_xlsx_unmasking_plan,
@@ -285,7 +290,7 @@ def _mask_document(
     input_path: Path,
     output_path: Path,
     vault: MaskingVault,
-) -> int:
+) -> tuple[int, int]:
     engine = MaskingEngine(vault)
     extension = input_path.suffix.lower()
 
@@ -303,19 +308,22 @@ def _mask_document(
             redacted_path = Path(temporary_dir) / "redacted.pdf"
             redact_pdf(plan, redacted_path)
             insert_pdf_tokens(redacted_path, plan, output_path)
-        return plan.total_replacements
+        metadata_count = mask_document_metadata(input_path, output_path, vault)
+        return plan.total_replacements, metadata_count
 
     if extension == ".docx":
         extracted = extract_docx_text(input_path)
         plan = build_docx_masking_plan(extracted, engine)
         apply_docx_masking_plan(plan, output_path)
-        return plan.replacements_count
+        metadata_count = mask_document_metadata(input_path, output_path, vault)
+        return plan.replacements_count, metadata_count
 
     if extension == ".xlsx":
         extracted = extract_xlsx_text(input_path)
         plan = build_xlsx_masking_plan(extracted, engine)
         apply_xlsx_masking_plan(plan, output_path)
-        return plan.replacements_count
+        metadata_count = mask_document_metadata(input_path, output_path, vault)
+        return plan.replacements_count, metadata_count
 
     raise CLIError(f"Unsupported format: {extension}")
 
@@ -328,9 +336,10 @@ def _restore_document(
     original_path: Path | None,
     vault_dir: Path,
     password: str,
-) -> int:
+) -> tuple[int, int]:
     engine = MaskingEngine(vault)
     extension = input_path.suffix.lower()
+    verify_masked_document(input_path, vault)
 
     if extension == ".pdf":
         if original_path is None:
@@ -361,7 +370,8 @@ def _restore_document(
         extracted = extract_pdf_text(original_path)
         plan = build_pdf_masking_plan(extracted, engine)
         restore_pdf(input_path, plan, output_path)
-        return plan.total_replacements
+        metadata_count = restore_document_metadata(output_path, vault)
+        return plan.total_replacements, metadata_count
 
     if original_path is not None:
         raise CLIError("--original is only used when restoring PDF files")
@@ -370,13 +380,15 @@ def _restore_document(
         extracted = extract_docx_text(input_path)
         plan = build_docx_unmasking_plan(extracted, engine)
         apply_docx_unmasking_plan(plan, output_path)
-        return plan.restored_count
+        metadata_count = restore_document_metadata(output_path, vault)
+        return plan.restored_count, metadata_count
 
     if extension == ".xlsx":
         extracted = extract_xlsx_text(input_path)
         plan = build_xlsx_unmasking_plan(extracted, engine)
         apply_xlsx_unmasking_plan(plan, output_path)
-        return plan.restored_count
+        metadata_count = restore_document_metadata(output_path, vault)
+        return plan.restored_count, metadata_count
 
     raise CLIError(f"Unsupported format: {extension}")
 
@@ -385,7 +397,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="document-anonymizer",
         description=(
-            "Reversibly mask sensitive text in PDF, DOCX, and XLSX documents."
+            "Reversibly mask document content and sanitize standard metadata in PDF, DOCX, and XLSX files."
         ),
     )
     parser.add_argument(
@@ -397,8 +409,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     mask_parser = subparsers.add_parser(
         "mask",
-        help="Mask sensitive text and save an encrypted vault",
-        description="Create a masked copy and an encrypted vault for later restoration.",
+        help="Mask content, sanitize standard metadata, and save an encrypted vault",
+        description="Create a masked copy, sanitize standard metadata, and save an encrypted vault for later restoration.",
     )
     mask_parser.add_argument("--input", required=True, type=Path, help="Source .pdf, .docx, or .xlsx file")
     mask_parser.add_argument("--output", required=True, type=Path, help="New masked output path")
@@ -413,10 +425,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--vault-id",
         help="Optional vault ID; generated automatically when omitted",
     )
+    mask_parser.add_argument(
+        "--normalization",
+        choices=("none", "unicode", "persian"),
+        default="none",
+        help=(
+            "Text matching normalization policy. Use 'persian' for Persian/Arabic "
+            "Yeh and Kaf variants; default: none."
+        ),
+    )
+    mask_parser.add_argument(
+        "--ignore-zwnj",
+        action="store_true",
+        help=(
+            "With --normalization persian, treat ZWNJ/half-space as optional "
+            "during matching."
+        ),
+    )
 
     restore_parser = subparsers.add_parser(
         "restore",
-        help="Restore known tokens using an encrypted vault",
+        help="Restore document content and metadata using an encrypted vault",
         description=(
             "Create a restored copy. PDF additionally requires the exact original PDF."
         ),
@@ -451,7 +480,12 @@ def main(argv: list[str] | None = None) -> int:
 
             ruleset = _load_ruleset(args.rules.expanduser().resolve())
             vault_id = args.vault_id or str(uuid4())
-            vault = MaskingVault(ruleset, vault_id=vault_id)
+            vault = MaskingVault(
+                ruleset,
+                vault_id=vault_id,
+                normalization=args.normalization,
+                ignore_zwnj=args.ignore_zwnj,
+            )
             store = FileVaultStore(args.vault_dir.expanduser())
 
             if store.exists(vault_id):
@@ -460,17 +494,17 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             password = _prompt_new_password()
-            original_sha256 = _sha256_file(input_path) if extension == ".pdf" else None
+            original_sha256 = _sha256_file(input_path)
 
             try:
-                replacement_count = _mask_document(
+                replacement_count, metadata_count = _mask_document(
                     input_path,
                     output_path,
                     vault,
                 )
+                if _sha256_file(input_path) != original_sha256:
+                    raise CLIError("Source document changed during masking")
                 if extension == ".pdf":
-                    if _sha256_file(input_path) != original_sha256:
-                        raise CLIError("Source PDF changed during masking")
                     masked_sha256 = _sha256_file(output_path)
                     store.save(vault, password)
                     _write_pdf_metadata(
@@ -491,8 +525,11 @@ def main(argv: list[str] | None = None) -> int:
 
             print("Masking completed successfully.")
             print(f"Format: {extension[1:].upper()}")
-            print(f"Replacements: {replacement_count}")
+            print(f"Content replacements: {replacement_count}")
+            print(f"Metadata properties sanitized: {metadata_count}")
             print(f"Vault ID: {vault_id}")
+            print(f"Normalization: {vault.normalization}")
+            print(f"Ignore ZWNJ: {vault.ignore_zwnj}")
             print(f"Encrypted vault directory: {store.directory.resolve()}")
             print(f"Masked output: {output_path}")
             if extension == ".pdf":
@@ -517,7 +554,7 @@ def main(argv: list[str] | None = None) -> int:
         password = _prompt_password()
         vault = store.load(args.vault_id, password)
 
-        restored_count = _restore_document(
+        restored_count, metadata_count = _restore_document(
             input_path,
             output_path,
             vault,
@@ -528,12 +565,18 @@ def main(argv: list[str] | None = None) -> int:
 
         print("Restoration completed successfully.")
         print(f"Format: {extension[1:].upper()}")
-        print(f"Restored occurrences: {restored_count}")
+        print(f"Restored content occurrences: {restored_count}")
+        print(f"Restored metadata parts/properties: {metadata_count}")
         print(f"Vault ID: {vault.vault_id}")
         print(f"Restored output: {output_path}")
         return 0
 
     except Exception as exc:
+        if args.command == "restore" and getattr(args, "output", None):
+            try:
+                args.output.expanduser().resolve().unlink(missing_ok=True)
+            except OSError:
+                pass
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 

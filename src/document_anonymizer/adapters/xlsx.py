@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -1674,6 +1676,34 @@ def _xlsx_defined_names_snapshot(workbook) -> tuple:
     )
 
 
+def _xlsx_properties_snapshot(workbook) -> dict:
+    """Return stable workbook properties for save/reload verification.
+
+    OOXML core-property timestamps are serialized with second precision by
+    openpyxl. Normalize datetime microseconds before comparison because
+    sub-second precision cannot be represented in the file format.
+
+    ``modified`` is intentionally excluded: openpyxl's ExcelWriter updates
+    ``workbook.properties.modified`` to the current UTC time every time it
+    saves a workbook. That writer-generated value can change between the
+    pre-save snapshot and the verification reload, even when the workbook
+    content and all preserved properties are correct.
+
+    The metadata layer separately stores the original OOXML core-properties
+    part in the encrypted vault and restores it byte-for-byte after content
+    restoration. Therefore excluding this transient writer-generated field
+    here does not discard the original modification timestamp.
+    """
+    snapshot = deepcopy(vars(workbook.properties))
+    snapshot.pop("modified", None)
+    return {
+        key: value.replace(microsecond=0)
+        if isinstance(value, datetime)
+        else value
+        for key, value in snapshot.items()
+    }
+
+
 def _verify_xlsx_unmasked_workbook(
     workbook,
     plan: XLSXUnmaskPlan,
@@ -1789,7 +1819,7 @@ def _verify_xlsx_unmasked_workbook(
                         f"{worksheet.title}!{skipped.coordinate}"
                     )
 
-    if vars(workbook.properties) != metadata_snapshot["properties"]:
+    if _xlsx_properties_snapshot(workbook) != metadata_snapshot["properties"]:
         raise XLSXAdapterError(
             "Workbook document properties were not preserved"
         )
@@ -1930,7 +1960,7 @@ def apply_xlsx_unmasking_plan(
             )
 
         metadata_snapshot = {
-            "properties": deepcopy(vars(workbook.properties)),
+            "properties": _xlsx_properties_snapshot(workbook),
             "calculation": deepcopy(vars(workbook.calculation)),
             "defined_names": _xlsx_defined_names_snapshot(workbook),
         }

@@ -1,0 +1,34 @@
+{
+  "rules": [
+    {
+      "rule_id": "persian-full-name",
+      "kind": "literal",
+      "pattern": "علی رضایی",
+      "priority": 200
+    },
+    {
+      "rule_id": "persian-mobile",
+      "kind": "regex",
+      "pattern": "۰۹[۰-۹]{9}",
+      "priority": 150
+    },
+    {
+      "rule_id": "persian-address",
+      "kind": "literal",
+      "pattern": "خیابان ولیعصر",
+      "priority": 150
+    },
+    {
+      "rule_id": "zwnj-phrase",
+      "kind": "literal",
+      "pattern": "میروم",
+      "priority": 100
+    },
+    {
+      "rule_id": "email",
+      "kind": "regex",
+      "pattern": "[\\w.-]+@[\\w.-]+\\.\\w+",
+      "case_sensitive": false
+    }
+  ]
+}

@@ -40,3 +40,7 @@ htmlcov/
 .tox/
 .idea/
 .vscode/
+persian_demo_output/
+english_demo_smoke/
+
+metadata_demo_output/

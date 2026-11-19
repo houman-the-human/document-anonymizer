@@ -30,6 +30,9 @@ from document_anonymizer.core.models import (
 )
 
 from document_anonymizer.core.tokens import TOKEN_PATTERN
+from document_anonymizer.core.engine import MaskingEngine
+from document_anonymizer.core.rules import MaskingRule, RuleSet
+from document_anonymizer.core.vault import MaskingVault
 
 
 class FakeVault:
@@ -1590,3 +1593,77 @@ def test_apply_docx_unmasking_without_tokens(tmp_path):
     restored = extract_docx_text(output)
 
     assert restored.text == extracted.text
+
+
+
+def test_docx_persian_normalization_preserves_exact_original_spelling(tmp_path):
+    source = tmp_path / "persian.docx"
+    masked = tmp_path / "persian-masked.docx"
+    restored = tmp_path / "persian-restored.docx"
+
+    document = Document()
+    document.add_paragraph("نام مشتری: علي كاظم")
+    document.save(source)
+
+    rules = RuleSet((
+        MaskingRule("customer-name", "literal", "علی کاظم"),
+    ))
+    engine = MaskingEngine(
+        MaskingVault(rules, normalization="persian")
+    )
+
+    extracted = extract_docx_text(source)
+    plan = build_docx_masking_plan(extracted, engine)
+
+    assert plan.replacements_count == 1
+    replacement = plan.paragraphs[0].replacements[0]
+    assert replacement.original == "علي كاظم"
+    assert plan.paragraphs[0].original_text[
+        replacement.start:replacement.end
+    ] == "علي كاظم"
+
+    apply_docx_masking_plan(plan, masked)
+    masked_text = extract_docx_text(masked).text
+    assert "علي كاظم" not in masked_text
+    assert replacement.token in masked_text
+
+    unmask_plan = build_docx_unmasking_plan(
+        extract_docx_text(masked),
+        engine,
+    )
+    apply_docx_unmasking_plan(unmask_plan, restored)
+    assert extract_docx_text(restored).text == extracted.text
+
+
+def test_docx_persian_half_space_is_optional_but_restored_exactly(tmp_path):
+    source = tmp_path / "persian-zwnj.docx"
+    masked = tmp_path / "persian-zwnj-masked.docx"
+    restored = tmp_path / "persian-zwnj-restored.docx"
+
+    document = Document()
+    document.add_paragraph("وضعیت: می‌روم")
+    document.save(source)
+
+    rules = RuleSet((
+        MaskingRule("verb", "literal", "میروم"),
+    ))
+    engine = MaskingEngine(
+        MaskingVault(
+            rules,
+            normalization="persian",
+            ignore_zwnj=True,
+        )
+    )
+
+    original_text = extract_docx_text(source).text
+    plan = build_docx_masking_plan(extract_docx_text(source), engine)
+    assert plan.replacements_count == 1
+    assert plan.paragraphs[0].replacements[0].original == "می‌روم"
+
+    apply_docx_masking_plan(plan, masked)
+    unmask_plan = build_docx_unmasking_plan(
+        extract_docx_text(masked),
+        engine,
+    )
+    apply_docx_unmasking_plan(unmask_plan, restored)
+    assert extract_docx_text(restored).text == original_text

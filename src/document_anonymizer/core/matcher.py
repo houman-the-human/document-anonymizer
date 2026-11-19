@@ -7,8 +7,10 @@ import regex
 
 from .exceptions import (
     RegexTimeoutError,
+    UnsafeNormalizedMatchError,
     ZeroWidthMatchError,
 )
+from .normalization import normalize_text, validate_normalization
 from .models import MatchCandidate
 from .rules import RuleSet, compile_rule
 
@@ -41,6 +43,9 @@ class Matcher:
         self,
         ruleset: RuleSet,
         regex_timeout_seconds: float = 0.2,
+        normalization: str = "none",
+        *,
+        ignore_zwnj: bool = False,
     ):
         if not isinstance(ruleset, RuleSet):
             raise TypeError("ruleset must be a RuleSet")
@@ -57,6 +62,10 @@ class Matcher:
 
         self.ruleset = ruleset
         self.regex_timeout = float(regex_timeout_seconds)
+        self.normalization, self.ignore_zwnj = validate_normalization(
+            normalization,
+            ignore_zwnj,
+        )
 
         self._compiled_rules = self._compile_rules()
 
@@ -70,7 +79,11 @@ class Matcher:
             if not rule.enabled:
                 continue
 
-            compiled = compile_rule(rule)
+            compiled = compile_rule(
+                rule,
+                self.normalization,
+                ignore_zwnj=self.ignore_zwnj,
+            )
 
             compiled_rules.append(
                 _CompiledRule(
@@ -98,32 +111,51 @@ class Matcher:
             raise TypeError("Input text must be a string")
 
         candidates = []
+        normalized = normalize_text(
+            text,
+            self.normalization,
+            ignore_zwnj=self.ignore_zwnj,
+        )
 
         for compiled_rule in self._compiled_rules:
 
             try:
                 matches = compiled_rule.pattern.finditer(
-                    text,
+                    normalized.text,
                     overlapped=True,
                     timeout=self.regex_timeout,
                 )
 
                 for match in matches:
 
-                    start, end = match.span(0)
+                    normalized_start, normalized_end = match.span(0)
 
                     # Empty matches cannot be masked safely.
-                    if start == end:
+                    if normalized_start == normalized_end:
                         raise ZeroWidthMatchError(
                             f"Rule '{compiled_rule.rule_id}' "
                             "produced a zero-width match"
                         )
 
+                    try:
+                        start, end = normalized.source_span(
+                            normalized_start,
+                            normalized_end,
+                        )
+                    except UnsafeNormalizedMatchError as exc:
+                        raise UnsafeNormalizedMatchError(
+                            f"Rule '{compiled_rule.rule_id}' produced a match "
+                            "that cuts through a normalized grapheme cluster"
+                        ) from exc
+
+                    # Keep the exact original spelling and source offsets.
+                    original_value = text[start:end]
+
                     candidates.append(
                         MatchCandidate(
                             start=start,
                             end=end,
-                            value=match.group(0),
+                            value=original_value,
                             rule_id=compiled_rule.rule_id,
                             priority=compiled_rule.priority,
                             rule_index=compiled_rule.rule_index,
