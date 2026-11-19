@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "document-anonymizer"
+version = "0.1.0"
+description = "Reversible document text masking and restoration"
+requires-python = ">=3.10"
+dependencies = [
+    "regex>=2024.0.0",
+    "cryptography>=42.0.0",
+    "PyMuPDF>=1.24,<2",
+    "openpyxl>=3.1.0",
+    "python-docx>=1.1.2",
+]
+
+[project.scripts]
+document-anonymizer = "document_anonymizer.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["document_anonymizer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v"

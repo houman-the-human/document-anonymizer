@@ -1,0 +1,29 @@
+{
+  "rules": [
+    {
+      "rule_id": "person-name",
+      "kind": "literal",
+      "pattern": "Alex Morgan"
+    },
+    {
+      "rule_id": "email",
+      "kind": "literal",
+      "pattern": "alex.morgan@example.test"
+    },
+    {
+      "rule_id": "phone",
+      "kind": "literal",
+      "pattern": "+1-202-555-0147"
+    },
+    {
+      "rule_id": "reference",
+      "kind": "literal",
+      "pattern": "ID-EXAMPLE-2048"
+    },
+    {
+      "rule_id": "address",
+      "kind": "literal",
+      "pattern": "42 Example Avenue"
+    }
+  ]
+}
